@@ -1,4 +1,4 @@
-import type { OidcAuthorizationRequest, OidcError } from "./types";
+import { OidcError, type OidcAuthorizationRequest } from "./types";
 
 export function parseAuthorizationRequest(url: URL): OidcAuthorizationRequest {
 	const scope = (url.searchParams.get("scope") ?? "")
@@ -48,11 +48,11 @@ export function oidcError(
 	errorDescription?: string,
 	status = 400,
 ): OidcError {
-	return { error, errorDescription, status };
+	return new OidcError(error, errorDescription, status);
 }
 
 export function isOidcError(value: unknown): value is OidcError {
-	return value !== null && typeof value === "object" && "error" in value;
+	return value instanceof OidcError;
 }
 
 export function scopeToEsaScope(scope: string[]): string {

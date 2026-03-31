@@ -16,10 +16,15 @@ export interface OidcAuthorizationRequest {
 	nonce: string | null;
 }
 
-export interface OidcError {
-	error: string;
-	errorDescription?: string;
-	status?: number;
+export class OidcError extends Error {
+	constructor(
+		public readonly error: string,
+		public readonly errorDescription?: string,
+		public readonly status = 400,
+	) {
+		super(errorDescription ?? error);
+		this.name = "OidcError";
+	}
 }
 
 export interface TransientAuthSession {
@@ -67,6 +72,15 @@ export interface OidcTokenResponse {
 	expires_in: number;
 	id_token: string;
 	scope: string;
+}
+
+export interface OIDCUserInfoResponse {
+	sub: string;
+	name?: string;
+	preferred_username?: string;
+	email?: string;
+	email_verified?: boolean;
+	picture?: string;
 }
 
 export interface JwtPayload {

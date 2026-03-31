@@ -1,62 +1,66 @@
+import { Hono } from "hono";
 import { buildAuthorizeUrl, exchangeAuthorizationCode, fetchCurrentUser } from "./esa";
-import { getConfig } from "./config";
+import { getConfig, type ResolvedConfig } from "./config";
 import { exportJwks, signJwt, verifyJwt } from "./jwt";
-import { isOidcError, oidcError, parseAuthorizationRequest, scopeToEsaScope, userInfoScope, validateTokenRequest } from "./oidc";
+import {
+	isOidcError,
+	oidcError,
+	parseAuthorizationRequest,
+	scopeToEsaScope,
+	userInfoScope,
+	validateTokenRequest,
+} from "./oidc";
 import { TransientStore } from "./store";
-import type { AdapterEnv, JwtPayload, OidcTokenResponse, OidcUserClaims } from "./types";
-import { currentEpochSeconds, errorDescription, json, parseForm, randomToken, secondsFromNow } from "./utils";
+import type {
+	AdapterEnv,
+	JwtPayload,
+	OIDCUserInfoResponse,
+	OidcTokenResponse,
+	OidcUserClaims,
+} from "./types";
+import { currentEpochSeconds, errorDescription, parseForm, randomToken } from "./utils";
 
 const ACCESS_TOKEN_TTL_SECONDS = 3600;
 const ID_TOKEN_TTL_SECONDS = 3600;
 
-export default {
-	async fetch(request: Request, env: AdapterEnv): Promise<Response> {
-		try {
-			const config = getConfig(env);
-			const url = new URL(request.url);
+type AppEnv = {
+	Bindings: AdapterEnv;
+	Variables: {
+		config: ResolvedConfig;
+		store: TransientStore;
+	};
+};
 
-			switch (url.pathname) {
-				case "/.well-known/openid-configuration":
-					return handleDiscovery(config);
-				case "/authorize":
-					return await handleAuthorize(url, config);
-				case "/callback":
-					return await handleCallback(url, config);
-				case "/token":
-					return await handleToken(request, config);
-				case "/userinfo":
-					return await handleUserInfo(request, config);
-				case "/jwks.json":
-					return await handleJwks(config);
-				case "/healthz":
-					return json({ ok: true });
-				default:
-					return json({ error: "not_found" }, { status: 404 });
-			}
-		} catch (error) {
-			if (isOidcError(error)) {
-				return json(
-					{
-						error: error.error,
-						error_description: error.errorDescription,
-					},
-					{ status: error.status ?? 400 },
-				);
-			}
+const app = new Hono<AppEnv>();
 
-			return json(
-				{
-					error: "server_error",
-					error_description: errorDescription(error),
-				},
-				{ status: 500 },
-			);
-		}
-	},
-} satisfies ExportedHandler<AdapterEnv>;
+app.use("*", async (c, next) => {
+	const config = getConfig(c.env);
+	c.set("config", config);
+	c.set("store", new TransientStore(config.transientStore));
+	await next();
+});
 
-function handleDiscovery(config: ReturnType<typeof getConfig>): Response {
-	return json({
+app.onError((error, c) => {
+	if (isOidcError(error)) {
+		c.status(error.status as 400);
+		return c.json({
+			error: error.error,
+			error_description: error.errorDescription,
+		});
+	}
+
+	c.status(500);
+	return c.json({
+		error: "server_error",
+		error_description: errorDescription(error),
+	});
+});
+
+app.notFound((c) => c.json({ error: "not_found" }, 404));
+
+app.get("/.well-known/openid-configuration", (c) => {
+	const config = c.var.config;
+	return c.json({
 		issuer: config.issuer,
 		authorization_endpoint: `${config.issuer}/authorize`,
 		token_endpoint: `${config.issuer}/token`,
@@ -70,16 +74,18 @@ function handleDiscovery(config: ReturnType<typeof getConfig>): Response {
 		scopes_supported: ["openid", "profile", "email", "read", "write"],
 		claims_supported: ["sub", "name", "preferred_username", "email", "email_verified", "picture"],
 	});
-}
+});
 
-async function handleAuthorize(url: URL, config: ReturnType<typeof getConfig>): Promise<Response> {
-	const request = parseAuthorizationRequest(url);
+app.get("/authorize", async (c) => {
+	const config = c.var.config;
+	const store = c.var.store;
+	const request = parseAuthorizationRequest(new URL(c.req.url));
+
 	if (request.clientId !== config.esaClientId) {
 		throw oidcError("unauthorized_client", "Unknown client_id", 401);
 	}
 
 	const transientState = randomToken(24);
-	const store = new TransientStore(config.transientStore);
 	await store.putSession(transientState, {
 		clientId: request.clientId,
 		redirectUri: request.redirectUri,
@@ -89,24 +95,28 @@ async function handleAuthorize(url: URL, config: ReturnType<typeof getConfig>): 
 		createdAt: Date.now(),
 	});
 
-	const authorizeUrl = buildAuthorizeUrl({
-		team: config.esaTeam,
-		clientId: config.esaClientId,
-		redirectUri: config.callbackUrl,
-		scope: scopeToEsaScope(request.scope),
-		state: transientState,
-	});
+	return c.redirect(
+		buildAuthorizeUrl({
+			team: config.esaTeam,
+			clientId: config.esaClientId,
+			redirectUri: config.callbackUrl,
+			scope: scopeToEsaScope(request.scope),
+			state: transientState,
+		}),
+		302,
+	);
+});
 
-	return Response.redirect(authorizeUrl, 302);
-}
-
-async function handleCallback(url: URL, config: ReturnType<typeof getConfig>): Promise<Response> {
+app.get("/callback", async (c) => {
+	const config = c.var.config;
+	const store = c.var.store;
+	const url = new URL(c.req.url);
 	const transientState = url.searchParams.get("state");
+
 	if (!transientState) {
 		throw oidcError("invalid_request", "Missing callback state");
 	}
 
-	const store = new TransientStore(config.transientStore);
 	const session = await store.getSession(transientState);
 	await store.deleteSession(transientState);
 	if (!session) {
@@ -119,7 +129,7 @@ async function handleCallback(url: URL, config: ReturnType<typeof getConfig>): P
 		if (session.oidcState) {
 			target.searchParams.set("state", session.oidcState);
 		}
-		return Response.redirect(target.toString(), 302);
+		return c.redirect(target.toString(), 302);
 	}
 
 	const esaCode = url.searchParams.get("code");
@@ -129,7 +139,7 @@ async function handleCallback(url: URL, config: ReturnType<typeof getConfig>): P
 		if (session.oidcState) {
 			target.searchParams.set("state", session.oidcState);
 		}
-		return Response.redirect(target.toString(), 302);
+		return c.redirect(target.toString(), 302);
 	}
 
 	const adapterCode = randomToken(32);
@@ -143,11 +153,13 @@ async function handleCallback(url: URL, config: ReturnType<typeof getConfig>): P
 		target.searchParams.set("state", session.oidcState);
 	}
 
-	return Response.redirect(target.toString(), 302);
-}
+	return c.redirect(target.toString(), 302);
+});
 
-async function handleToken(request: Request, config: ReturnType<typeof getConfig>): Promise<Response> {
-	const params = await parseForm(request);
+app.post("/token", async (c) => {
+	const config = c.var.config;
+	const store = c.var.store;
+	const params = await parseForm(c.req.raw);
 	validateTokenRequest(params);
 
 	const clientId = params.get("client_id")!;
@@ -159,7 +171,6 @@ async function handleToken(request: Request, config: ReturnType<typeof getConfig
 		throw oidcError("invalid_client", "Client authentication failed", 401);
 	}
 
-	const store = new TransientStore(config.transientStore);
 	if (await store.isCodeUsed(code)) {
 		throw oidcError("invalid_grant", "Authorization code has already been used");
 	}
@@ -183,33 +194,34 @@ async function handleToken(request: Request, config: ReturnType<typeof getConfig
 	const esaUser = await fetchCurrentUser(esaToken.access_token);
 	const claims = mapClaims(esaUser);
 	const { sub, ...claimFields } = claims;
-
 	const now = currentEpochSeconds();
-		const idTokenPayload: JwtPayload = {
-			iss: config.issuer,
-			sub,
-			aud: clientId,
-			exp: now + ID_TOKEN_TTL_SECONDS,
-			iat: now,
-			auth_time: now,
-			nonce: authCode.nonce ?? undefined,
-			token_use: "id",
-			...claimFields,
-		};
-		const accessTokenPayload: JwtPayload = {
-			iss: config.issuer,
-			sub,
-			aud: `${config.issuer}/userinfo`,
-			exp: now + ACCESS_TOKEN_TTL_SECONDS,
-			iat: now,
-			nbf: now,
-			jti: randomToken(16),
-			scope: userInfoScope(authCode.scope),
-			token_use: "access",
-			...claimFields,
-		};
 
-	const tokenResponse: OidcTokenResponse = {
+	const idTokenPayload: JwtPayload = {
+		iss: config.issuer,
+		sub,
+		aud: clientId,
+		exp: now + ID_TOKEN_TTL_SECONDS,
+		iat: now,
+		auth_time: now,
+		nonce: authCode.nonce ?? undefined,
+		token_use: "id",
+		...claimFields,
+	};
+
+	const accessTokenPayload: JwtPayload = {
+		iss: config.issuer,
+		sub,
+		aud: `${config.issuer}/userinfo`,
+		exp: now + ACCESS_TOKEN_TTL_SECONDS,
+		iat: now,
+		nbf: now,
+		jti: randomToken(16),
+		scope: userInfoScope(authCode.scope),
+		token_use: "access",
+		...claimFields,
+	};
+
+	const response: OidcTokenResponse = {
 		access_token: await signJwt(config.privateKeyPemOrJwk, accessTokenPayload, "at+jwt"),
 		token_type: "Bearer",
 		expires_in: ACCESS_TOKEN_TTL_SECONDS,
@@ -217,22 +229,22 @@ async function handleToken(request: Request, config: ReturnType<typeof getConfig
 		scope: authCode.scope.join(" "),
 	};
 
-	return json(tokenResponse);
-}
+	return c.json(response);
+});
 
-async function handleUserInfo(request: Request, config: ReturnType<typeof getConfig>): Promise<Response> {
-	const authorization = request.headers.get("authorization");
+app.get("/userinfo", async (c) => {
+	const config = c.var.config;
+	const authorization = c.req.header("authorization");
+
 	if (!authorization?.startsWith("Bearer ")) {
-		return json(
+		return c.json(
 			{
 				error: "invalid_token",
 				error_description: "Missing bearer token",
 			},
+			401,
 			{
-				status: 401,
-				headers: {
-					"www-authenticate": 'Bearer error="invalid_token"',
-				},
+				"www-authenticate": 'Bearer error="invalid_token"',
 			},
 		);
 	}
@@ -243,19 +255,23 @@ async function handleUserInfo(request: Request, config: ReturnType<typeof getCon
 		tokenUse: "access",
 	});
 
-	return json({
+	const response: OIDCUserInfoResponse = {
 		sub: payload.sub,
 		name: payload.name,
 		preferred_username: payload.preferred_username,
 		email: payload.email,
 		email_verified: payload.email_verified,
 		picture: payload.picture,
-	});
-}
+	};
 
-async function handleJwks(config: ReturnType<typeof getConfig>): Promise<Response> {
-	return json(await exportJwks(config.privateKeyPemOrJwk));
-}
+	return c.json(response);
+});
+
+app.get("/jwks.json", async (c) => c.json(await exportJwks(c.var.config.privateKeyPemOrJwk)));
+
+app.get("/healthz", (c) => c.json({ ok: true }));
+
+export default app;
 
 function mapClaims(user: {
 	id: number;

@@ -1,17 +1,26 @@
+import jwt from "@tsndr/cloudflare-worker-jwt";
 import type { JwtPayload } from "./types";
-import { base64UrlDecode, base64UrlEncode, sha256base64Url } from "./utils";
+import { sha256base64Url } from "./utils";
 
 interface CachedKeys {
-	privateKey: CryptoKey;
+	privateJwk: PrivateJwk;
 	publicJwk: PublicJwk;
 	kid: string;
 }
+
+type PrivateJwk = JsonWebKey & {
+	kty: string;
+	n?: string;
+	e?: string;
+	d?: string;
+	kid?: string;
+};
 
 type PublicJwk = JsonWebKey & {
 	kty: string;
 	n?: string;
 	e?: string;
-	kid?: string;
+	kid: string;
 	use?: string;
 	alg?: string;
 	key_ops?: string[];
@@ -19,24 +28,20 @@ type PublicJwk = JsonWebKey & {
 
 let cachedKeysPromise: Promise<CachedKeys> | undefined;
 
-export async function signJwt(privateKeyPemOrJwk: string, payload: JwtPayload, typ = "JWT"): Promise<string> {
+export async function signJwt(
+	privateKeyPemOrJwk: string,
+	payload: JwtPayload,
+	typ = "JWT",
+): Promise<string> {
 	const keys = await getKeys(privateKeyPemOrJwk);
-	const header = {
-		alg: "RS256",
-		kid: keys.kid,
-		typ,
-	};
-
-	const encodedHeader = base64UrlEncode(JSON.stringify(header));
-	const encodedPayload = base64UrlEncode(JSON.stringify(payload));
-	const signingInput = `${encodedHeader}.${encodedPayload}`;
-	const signature = await crypto.subtle.sign(
-		{ name: "RSASSA-PKCS1-v1_5" },
-		keys.privateKey,
-		new TextEncoder().encode(signingInput),
-	);
-
-	return `${signingInput}.${base64UrlEncode(signature)}`;
+	return jwt.sign(payload, { ...keys.privateJwk, kid: keys.kid }, {
+		algorithm: "RS256",
+		header: {
+			alg: "RS256",
+			kid: keys.kid,
+			typ,
+		},
+	});
 }
 
 export async function exportJwks(privateKeyPemOrJwk: string): Promise<{ keys: PublicJwk[] }> {
@@ -60,33 +65,15 @@ export async function verifyJwt(
 	options: { audience: string; issuer: string; tokenUse: "access" | "id" },
 ): Promise<JwtPayload> {
 	const keys = await getKeys(privateKeyPemOrJwk);
-	const [encodedHeader, encodedPayload, encodedSignature] = token.split(".");
-	if (!encodedHeader || !encodedPayload || !encodedSignature) {
-		throw new Error("Malformed JWT");
+	const decoded = await jwt.verify<JwtPayload>(token, keys.publicJwk, {
+		algorithm: "RS256",
+		throwError: true,
+	});
+	if (!decoded) {
+		throw new Error("Invalid JWT");
 	}
 
-	const publicKey = await crypto.subtle.importKey(
-		"jwk",
-		keys.publicJwk,
-		{ name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
-		false,
-		["verify"],
-	);
-
-	const verified = await crypto.subtle.verify(
-		{ name: "RSASSA-PKCS1-v1_5" },
-		publicKey,
-		base64UrlDecode(encodedSignature),
-		new TextEncoder().encode(`${encodedHeader}.${encodedPayload}`),
-	);
-
-	if (!verified) {
-		throw new Error("Invalid JWT signature");
-	}
-
-	const payload = JSON.parse(new TextDecoder().decode(base64UrlDecode(encodedPayload))) as JwtPayload;
-	const now = Math.floor(Date.now() / 1000);
-
+	const payload = decoded.payload;
 	if (payload.iss !== options.issuer) {
 		throw new Error("Unexpected issuer");
 	}
@@ -94,12 +81,6 @@ export async function verifyJwt(
 	const audiences = Array.isArray(payload.aud) ? payload.aud : [payload.aud];
 	if (!audiences.includes(options.audience)) {
 		throw new Error("Unexpected audience");
-	}
-	if (payload.exp <= now) {
-		throw new Error("Token expired");
-	}
-	if (payload.nbf && payload.nbf > now) {
-		throw new Error("Token not yet valid");
 	}
 	if (payload.token_use !== options.tokenUse) {
 		throw new Error("Unexpected token use");
@@ -116,46 +97,49 @@ async function getKeys(privateKeyPemOrJwk: string): Promise<CachedKeys> {
 }
 
 async function loadKeys(privateKeyPemOrJwk: string): Promise<CachedKeys> {
-	const trimmed = privateKeyPemOrJwk.trim();
-	let privateKey: CryptoKey;
-	let privateJwk: JsonWebKey;
-
-	if (trimmed.startsWith("{")) {
-		privateJwk = JSON.parse(trimmed) as JsonWebKey;
-		privateKey = await crypto.subtle.importKey(
-			"jwk",
-			privateJwk,
-			{ name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
-			true,
-			["sign"],
-		);
-	} else {
-		const binary = atob(
-			trimmed
-				.replace("-----BEGIN PRIVATE KEY-----", "")
-				.replace("-----END PRIVATE KEY-----", "")
-				.replace(/\s+/gu, ""),
-		);
-		const bytes = new Uint8Array(binary.length);
-		for (let index = 0; index < binary.length; index += 1) {
-			bytes[index] = binary.charCodeAt(index);
-		}
-		privateKey = await crypto.subtle.importKey(
-			"pkcs8",
-			bytes,
-			{ name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
-			true,
-			["sign"],
-		);
-		privateJwk = (await crypto.subtle.exportKey("jwk", privateKey)) as JsonWebKey;
-	}
-
-	const { d, dp, dq, p, q, qi, oth, ...publicJwk } = privateJwk;
-	const kid = await sha256base64Url(JSON.stringify({ e: publicJwk.e, kty: publicJwk.kty, n: publicJwk.n }));
+	const privateJwk = await parsePrivateKey(privateKeyPemOrJwk);
+	const { d, dp, dq, p, q, qi, oth, key_ops, use, alg, kid, ...publicJwk } = privateJwk;
+	const resolvedKid =
+		kid ??
+		(await sha256base64Url(
+			JSON.stringify({
+				e: publicJwk.e,
+				kty: publicJwk.kty,
+				n: publicJwk.n,
+			}),
+		));
 
 	return {
-		privateKey,
-		publicJwk: publicJwk as PublicJwk,
-		kid,
+		privateJwk: { ...privateJwk, kid: resolvedKid },
+		publicJwk: { ...(publicJwk as PublicJwk), kid: resolvedKid },
+		kid: resolvedKid,
 	};
+}
+
+async function parsePrivateKey(privateKeyPemOrJwk: string): Promise<PrivateJwk> {
+	const trimmed = privateKeyPemOrJwk.trim();
+	if (trimmed.startsWith("{")) {
+		return JSON.parse(trimmed) as PrivateJwk;
+	}
+
+	const binary = atob(
+		trimmed
+			.replace("-----BEGIN PRIVATE KEY-----", "")
+			.replace("-----END PRIVATE KEY-----", "")
+			.replace(/\s+/gu, ""),
+	);
+	const bytes = new Uint8Array(binary.length);
+	for (let index = 0; index < binary.length; index += 1) {
+		bytes[index] = binary.charCodeAt(index);
+	}
+
+	const key = await crypto.subtle.importKey(
+		"pkcs8",
+		bytes,
+		{ name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+		true,
+		["sign"],
+	);
+
+	return (await crypto.subtle.exportKey("jwk", key)) as PrivateJwk;
 }
