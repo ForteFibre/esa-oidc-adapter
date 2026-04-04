@@ -18,7 +18,7 @@ import type {
 	OidcTokenResponse,
 	OidcUserClaims,
 } from "./types";
-import { currentEpochSeconds, errorDescription, parseForm, randomToken } from "./utils";
+import { currentEpochSeconds, errorDescription, randomToken } from "./utils";
 
 const ACCESS_TOKEN_TTL_SECONDS = 3600;
 const ID_TOKEN_TTL_SECONDS = 3600;
@@ -159,7 +159,13 @@ app.get("/callback", async (c) => {
 app.post("/token", async (c) => {
 	const config = c.var.config;
 	const store = c.var.store;
-	const params = await parseForm(c.req.raw);
+	const body = await c.req.parseBody();
+	const params = new URLSearchParams();
+	for (const [key, value] of Object.entries(body)) {
+		if (typeof value === "string") {
+			params.set(key, value);
+		}
+	}
 	validateTokenRequest(params);
 
 	const clientId = params.get("client_id")!;

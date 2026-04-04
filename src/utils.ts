@@ -63,23 +63,6 @@ export function currentEpochSeconds(): number {
 	return Math.floor(Date.now() / 1000);
 }
 
-export function parseForm(request: Request): Promise<URLSearchParams> {
-	const contentType = request.headers.get("content-type") ?? "";
-	if (contentType.includes("application/x-www-form-urlencoded")) {
-		return request.formData().then((form) => {
-			const params = new URLSearchParams();
-			for (const [key, value] of form.entries()) {
-				if (typeof value === "string") {
-					params.set(key, value);
-				}
-			}
-			return params;
-		});
-	}
-
-	return request.text().then((body) => new URLSearchParams(body));
-}
-
 export function errorDescription(error: unknown): string {
 	if (error instanceof Error) {
 		return error.message;
