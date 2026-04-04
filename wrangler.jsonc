@@ -15,8 +15,8 @@
 		"nodejs_compat"
 	],
 	"vars": {
-		"ESA_TEAM": "docs",
-		"ISSUER_URL": "https://adapter.example.com"
+		"ESA_TEAM": "fortefibre",
+		"ISSUER_URL": "https://esa-oidc-adapter.fortefibre.workers.dev"
 	},
 	"secrets": {
 		"required": [
@@ -27,7 +27,8 @@
 	},
 	"kv_namespaces": [
 		{
-			"binding": "TRANSIENT_STORE"
+			"binding": "TRANSIENT_STORE",
+			"id": "ac0c28ae1cc64c7f80238bc99fdb3ad6"
 		}
 	]
 	/**
