@@ -1,14 +1,16 @@
+import { zValidator } from "@hono/zod-validator";
 import { Hono } from "hono";
 import { buildAuthorizeUrl, exchangeAuthorizationCode, fetchCurrentUser } from "./esa";
 import { getConfig, type ResolvedConfig } from "./config";
 import { exportJwks, signJwt, verifyJwt } from "./jwt";
 import {
+	authorizeQuerySchema,
 	isOidcError,
+	oidcErrorFromZod,
 	oidcError,
-	parseAuthorizationRequest,
 	scopeToEsaScope,
+	tokenRequestSchema,
 	userInfoScope,
-	validateTokenRequest,
 } from "./oidc";
 import { TransientStore } from "./store";
 import type {
@@ -76,36 +78,44 @@ app.get("/.well-known/openid-configuration", (c) => {
 	});
 });
 
-app.get("/authorize", async (c) => {
-	const config = c.var.config;
-	const store = c.var.store;
-	const request = parseAuthorizationRequest(new URL(c.req.url));
+app.get(
+	"/authorize",
+	zValidator("query", authorizeQuerySchema, (result) => {
+		if (!result.success) {
+			throw oidcErrorFromZod(result.error);
+		}
+	}),
+	async (c) => {
+		const config = c.var.config;
+		const store = c.var.store;
+		const request = c.req.valid("query");
 
-	if (request.clientId !== config.esaClientId) {
-		throw oidcError("unauthorized_client", "Unknown client_id", 401);
-	}
+		if (request.clientId !== config.esaClientId) {
+			throw oidcError("unauthorized_client", "Unknown client_id", 401);
+		}
 
-	const transientState = randomToken(24);
-	await store.putSession(transientState, {
-		clientId: request.clientId,
-		redirectUri: request.redirectUri,
-		oidcState: request.state,
-		nonce: request.nonce,
-		scope: request.scope,
-		createdAt: Date.now(),
-	});
+		const transientState = randomToken(24);
+		await store.putSession(transientState, {
+			clientId: request.clientId,
+			redirectUri: request.redirectUri,
+			oidcState: request.state,
+			nonce: request.nonce,
+			scope: request.scope,
+			createdAt: Date.now(),
+		});
 
-	return c.redirect(
-		buildAuthorizeUrl({
-			team: config.esaTeam,
-			clientId: config.esaClientId,
-			redirectUri: config.callbackUrl,
-			scope: scopeToEsaScope(request.scope),
-			state: transientState,
-		}),
-		302,
-	);
-});
+		return c.redirect(
+			buildAuthorizeUrl({
+				team: config.esaTeam,
+				clientId: config.esaClientId,
+				redirectUri: config.callbackUrl,
+				scope: scopeToEsaScope(request.scope),
+				state: transientState,
+			}),
+			302,
+		);
+	},
+);
 
 app.get("/callback", async (c) => {
 	const config = c.var.config;
@@ -156,87 +166,88 @@ app.get("/callback", async (c) => {
 	return c.redirect(target.toString(), 302);
 });
 
-app.post("/token", async (c) => {
-	const config = c.var.config;
-	const store = c.var.store;
-	const body = await c.req.parseBody();
-	const params = new URLSearchParams();
-	for (const [key, value] of Object.entries(body)) {
-		if (typeof value === "string") {
-			params.set(key, value);
+app.post(
+	"/token",
+	zValidator("form", tokenRequestSchema, (result) => {
+		if (!result.success) {
+			throw oidcErrorFromZod(result.error);
 		}
-	}
-	validateTokenRequest(params);
+	}),
+	async (c) => {
+		const config = c.var.config;
+		const store = c.var.store;
+		const {
+			client_id: clientId,
+			client_secret: clientSecret,
+			redirect_uri: redirectUri,
+			code,
+		} = c.req.valid("form");
 
-	const clientId = params.get("client_id")!;
-	const clientSecret = params.get("client_secret")!;
-	const redirectUri = params.get("redirect_uri")!;
-	const code = params.get("code")!;
+		if (clientId !== config.esaClientId || clientSecret !== config.esaClientSecret) {
+			throw oidcError("invalid_client", "Client authentication failed", 401);
+		}
 
-	if (clientId !== config.esaClientId || clientSecret !== config.esaClientSecret) {
-		throw oidcError("invalid_client", "Client authentication failed", 401);
-	}
+		if (await store.isCodeUsed(code)) {
+			throw oidcError("invalid_grant", "Authorization code has already been used");
+		}
 
-	if (await store.isCodeUsed(code)) {
-		throw oidcError("invalid_grant", "Authorization code has already been used");
-	}
+		const authCode = await store.getCode(code);
+		if (!authCode) {
+			throw oidcError("invalid_grant", "Authorization code is invalid or expired");
+		}
+		if (authCode.redirectUri !== redirectUri) {
+			throw oidcError("invalid_grant", "redirect_uri mismatch");
+		}
 
-	const authCode = await store.getCode(code);
-	if (!authCode) {
-		throw oidcError("invalid_grant", "Authorization code is invalid or expired");
-	}
-	if (authCode.redirectUri !== redirectUri) {
-		throw oidcError("invalid_grant", "redirect_uri mismatch");
-	}
+		await store.markCodeUsed(code);
 
-	await store.markCodeUsed(code);
+		const esaToken = await exchangeAuthorizationCode({
+			clientId: config.esaClientId,
+			clientSecret: config.esaClientSecret,
+			redirectUri: config.callbackUrl,
+			code: authCode.esaCode,
+		});
+		const esaUser = await fetchCurrentUser(esaToken.access_token);
+		const claims = mapClaims(esaUser);
+		const { sub, ...claimFields } = claims;
+		const now = currentEpochSeconds();
 
-	const esaToken = await exchangeAuthorizationCode({
-		clientId: config.esaClientId,
-		clientSecret: config.esaClientSecret,
-		redirectUri: config.callbackUrl,
-		code: authCode.esaCode,
-	});
-	const esaUser = await fetchCurrentUser(esaToken.access_token);
-	const claims = mapClaims(esaUser);
-	const { sub, ...claimFields } = claims;
-	const now = currentEpochSeconds();
+		const idTokenPayload: JwtPayload = {
+			iss: config.issuer,
+			sub,
+			aud: clientId,
+			exp: now + ID_TOKEN_TTL_SECONDS,
+			iat: now,
+			auth_time: now,
+			nonce: authCode.nonce ?? undefined,
+			token_use: "id",
+			...claimFields,
+		};
 
-	const idTokenPayload: JwtPayload = {
-		iss: config.issuer,
-		sub,
-		aud: clientId,
-		exp: now + ID_TOKEN_TTL_SECONDS,
-		iat: now,
-		auth_time: now,
-		nonce: authCode.nonce ?? undefined,
-		token_use: "id",
-		...claimFields,
-	};
+		const accessTokenPayload: JwtPayload = {
+			iss: config.issuer,
+			sub,
+			aud: `${config.issuer}/userinfo`,
+			exp: now + ACCESS_TOKEN_TTL_SECONDS,
+			iat: now,
+			nbf: now,
+			jti: randomToken(16),
+			scope: userInfoScope(authCode.scope),
+			token_use: "access",
+			...claimFields,
+		};
 
-	const accessTokenPayload: JwtPayload = {
-		iss: config.issuer,
-		sub,
-		aud: `${config.issuer}/userinfo`,
-		exp: now + ACCESS_TOKEN_TTL_SECONDS,
-		iat: now,
-		nbf: now,
-		jti: randomToken(16),
-		scope: userInfoScope(authCode.scope),
-		token_use: "access",
-		...claimFields,
-	};
+		const response: OidcTokenResponse = {
+			access_token: await signJwt(config.privateKeyPemOrJwk, accessTokenPayload, "at+jwt"),
+			token_type: "Bearer",
+			expires_in: ACCESS_TOKEN_TTL_SECONDS,
+			id_token: await signJwt(config.privateKeyPemOrJwk, idTokenPayload),
+			scope: authCode.scope.join(" "),
+		};
 
-	const response: OidcTokenResponse = {
-		access_token: await signJwt(config.privateKeyPemOrJwk, accessTokenPayload, "at+jwt"),
-		token_type: "Bearer",
-		expires_in: ACCESS_TOKEN_TTL_SECONDS,
-		id_token: await signJwt(config.privateKeyPemOrJwk, idTokenPayload),
-		scope: authCode.scope.join(" "),
-	};
-
-	return c.json(response);
-});
+		return c.json(response);
+	},
+);
 
 app.get("/userinfo", async (c) => {
 	const config = c.var.config;

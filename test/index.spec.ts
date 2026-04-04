@@ -80,6 +80,32 @@ describe('esa OIDC adapter', () => {
 		});
 	});
 
+	it('rejects authorize requests missing client_id', async () => {
+		const response = await request(
+			'https://adapter.example.com/authorize?redirect_uri=https%3A%2F%2Fclient.example.com%2Fcb&response_type=code&scope=openid%20profile',
+			{ redirect: 'manual' },
+		);
+
+		expect(response.status).toBe(400);
+		await expect(response.json()).resolves.toMatchObject({
+			error: 'invalid_request',
+			error_description: 'Missing client_id',
+		});
+	});
+
+	it('rejects authorize requests with unsupported response_type', async () => {
+		const response = await request(
+			'https://adapter.example.com/authorize?client_id=test-client-id&redirect_uri=https%3A%2F%2Fclient.example.com%2Fcb&response_type=token&scope=openid%20profile',
+			{ redirect: 'manual' },
+		);
+
+		expect(response.status).toBe(400);
+		await expect(response.json()).resolves.toMatchObject({
+			error: 'unsupported_response_type',
+			error_description: 'Only response_type=code is supported',
+		});
+	});
+
 	it('redirects authorize requests to esa', async () => {
 		const response = await request(
 			'https://adapter.example.com/authorize?client_id=test-client-id&redirect_uri=https%3A%2F%2Fclient.example.com%2Fcb&response_type=code&scope=openid%20profile%20email&state=client-state&nonce=nonce-123',
@@ -207,6 +233,49 @@ describe('esa OIDC adapter', () => {
 		expect(second.status).toBe(400);
 		await expect(second.json()).resolves.toMatchObject({
 			error: 'invalid_grant',
+		});
+	});
+
+	it('rejects token requests with unsupported grant_type', async () => {
+		const response = await request('https://adapter.example.com/token', {
+			method: 'POST',
+			headers: {
+				'content-type': 'application/x-www-form-urlencoded',
+			},
+			body: new URLSearchParams({
+				grant_type: 'refresh_token',
+				code: 'any-code',
+				client_id: 'test-client-id',
+				client_secret: 'test-client-secret',
+				redirect_uri: 'https://client.example.com/cb',
+			}),
+		});
+
+		expect(response.status).toBe(400);
+		await expect(response.json()).resolves.toMatchObject({
+			error: 'unsupported_grant_type',
+			error_description: 'Only authorization_code is supported',
+		});
+	});
+
+	it('rejects token requests missing client_secret', async () => {
+		const response = await request('https://adapter.example.com/token', {
+			method: 'POST',
+			headers: {
+				'content-type': 'application/x-www-form-urlencoded',
+			},
+			body: new URLSearchParams({
+				grant_type: 'authorization_code',
+				code: 'any-code',
+				client_id: 'test-client-id',
+				redirect_uri: 'https://client.example.com/cb',
+			}),
+		});
+
+		expect(response.status).toBe(400);
+		await expect(response.json()).resolves.toMatchObject({
+			error: 'invalid_request',
+			error_description: 'Missing client_secret',
 		});
 	});
 
